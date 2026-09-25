@@ -1,172 +1,194 @@
-const cooldownSecondsByLevel = {
-  0: 0,
-  1: 60,
-  2: 120,
-  3: 300,
-};
+// Server-side attempt limits + escalation for POST /judge.
+//
+// The browser is NEVER trusted to enforce limits: the client is keyed by
+// server-derived req.ip, and any client-submitted escalation/verdict fields
+// are ignored by the route. All decisions here are computed server-side.
+//
+// Modular design: AttemptTracker depends only on the small AttemptStore
+// interface ({ append, list, prune, clear, clientIds, size }), so the
+// in-memory store can later be swapped for Redis or a database without
+// touching routes.
+//
+// PRODUCTION WARNING: InMemoryAttemptStore keeps state in a single Node.js
+// process. It is lost on restart, is not shared between instances, and must
+// NOT be relied on for multi-instance production deployment. Use a shared
+// store (Redis/DB) behind a load balancer.
 
-const VALID_VERDICTS_FOR_CONSECUTIVE = ['deny', 'task'];
+const config = require('../config');
 
-class AttemptTracker {
-  constructor() {
-    this.minuteBuckets = new Map();
-    this.consecutiveResults = new Map();
-    this.escalationLevels = new Map();
-    this.totalJudgesPerSession = new Map();
-    this.lastSessionReset = new Map();
+const ONE_MINUTE_MS = 60 * 1000;
 
-    this.maxRequestsPerMinute = parseInt(process.env.MAX_REQUESTS_PER_MINUTE) || 30;
-    this.maxJudgesPerSession = parseInt(process.env.MAX_JUDGES_PER_SESSION) || 20;
-    this.escalationWindowMinutes = parseInt(process.env.ESCALATION_WINDOW_MINUTES) || 30;
-    this.maxConsecutiveDeniesTasks = parseInt(
-      process.env.MAX_CONSECUTIVE_DENIES_TASKS) || 5;
+// Consecutive non-allow streak needed to reach each escalation level.
+// Index = level. Kept modest and non-punitive by design.
+const ESCALATION_STREAK_THRESHOLDS = [0, 2, 4, 6];
+// Cooldown (seconds) reported per level. Capped at 5 minutes — firm but not
+// punitive. Level 0 means "no cooldown".
+const ESCALATION_COOLDOWNS = [0, 60, 120, 300];
+const MAX_ESCALATION_LEVEL = 3;
+
+// Hygiene caps so one actor cannot exhaust server memory.
+const MAX_ATTEMPTS_PER_CLIENT = 200;
+const MAX_TRACKED_CLIENTS = 10000;
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+// ---- Store interface (implement for Redis/DB later) ----
+// append(clientId, entry) / list(clientId) -> entry[] (asc by ts) /
+// prune(clientId, windowMs, now) / clear(clientId) / clientIds() / size()
+
+class InMemoryAttemptStore {
+  constructor({ maxClients = MAX_TRACKED_CLIENTS } = {}) {
+    this.clients = new Map(); // clientId -> [{ ts, verdict, requiredWaitSeconds }]
+    this.maxClients = maxClients;
   }
 
-  _getClientId(req) {
-    return req.ip || 'unknown';
-  }
-
-  _purgeOldMinutes(clientId) {
-    const now = Date.now();
-    const minuteIndex = Math.floor(now / 60000);
-    const windowMinutes = this.escalationWindowMinutes;
-    const windowMs = windowMinutes * 60 * 1000;
-    const minAllowedIndex = Math.floor((now - windowMs) / 60000);
-
-    const buckets = this.minuteBuckets.get(clientId);
-    if (!buckets) return;
-
-    for (const [key, count] of buckets) {
-      if (key < minAllowedIndex) {
-        buckets.delete(key);
+  append(clientId, entry) {
+    let list = this.clients.get(clientId);
+    if (!list) {
+      if (this.clients.size >= this.maxClients) {
+        // FIFO eviction of the oldest client bucket (dev-grade safety valve).
+        const oldest = this.clients.keys().next().value;
+        this.clients.delete(oldest);
       }
+      list = [];
+      this.clients.set(clientId, list);
+    }
+    list.push(entry);
+    if (list.length > MAX_ATTEMPTS_PER_CLIENT) {
+      list.splice(0, list.length - MAX_ATTEMPTS_PER_CLIENT);
     }
   }
 
-  _purgeOldSessionData(clientId) {
-    const now = Date.now();
-    const sessionData = this.totalJudgesPerSession.get(clientId) || {};
-    const sessionStart = this.lastSessionReset.get(clientId) || now;
-
-    if (now - sessionStart > this.escalationWindowMinutes * 60 * 1000) {
-      this.totalJudgesPerSession.set(clientId, 0);
-      this.lastSessionReset.set(clientId, now);
-    }
+  list(clientId) {
+    return this.clients.get(clientId) || [];
   }
 
-  checkLimits(req) {
-    const clientId = this._getClientId(req);
-    const now = Date.now();
-
-    this._purgeOldMinutes(clientId);
-    this._purgeOldSessionData(clientId);
-
-    // 1. Check requests per minute
-    let buckets = this.minuteBuckets.get(clientId);
-    if (!buckets) {
-      buckets = new Map();
-      this.minuteBuckets.set(clientId, buckets);
-    }
-
-    const minuteIndex = Math.floor(now / 60000);
-    const currentMinuteCount = (buckets.get(minuteIndex) || 0) + 1;
-    buckets.set(minuteIndex, currentMinuteCount);
-
-    if (currentMinuteCount > this.maxRequestsPerMinute) {
-      return {
-        success: false,
-        error: 'Rate limit exceeded - too many requests per minute',
-        rateLimited: true,
-      };
-    }
-
-    // 2. Check total judges per session
-    let totalJudges = this.totalJudgesPerSession.get(clientId) || 0;
-    totalJudges++;
-    this.totalJudgesPerSession.set(clientId, totalJudges);
-
-    if (totalJudges > this.maxJudgesPerSession) {
-      return {
-        success: false,
-        error: 'Too many judges in this session',
-        rateLimited: true,
-      };
-    }
-
-    return { success: true, rateLimited: false };
+  prune(clientId, windowMs, now = Date.now()) {
+    const list = this.clients.get(clientId);
+    if (!list) return;
+    const cutoff = now - windowMs;
+    while (list.length > 0 && list[0].ts <= cutoff) list.shift();
+    if (list.length === 0) this.clients.delete(clientId);
   }
 
-  recordVerdict(verdict) {
-    // This is called after the LLM verdict is determined
-    // It needs the clientId from the current request context
-    // We'll use a static method with clientId passed explicitly
-    throw new Error('Use recordVerdictWithClientId instead');
+  clear(clientId) {
+    this.clients.delete(clientId);
   }
 
-  recordVerdictWithClientId(clientId, verdict) {
-    if (!VALID_VERDICTS_FOR_CONSECUTIVE.includes(verdict)) {
-      // Not a deny or task, reset consecutive count
-      const existing = this.consecutiveResults.get(clientId);
-      if (existing) {
-        existing.count = 0;
-        existing.lastVerdict = null;
-        existing.firstTimestamp = null;
-      }
-      return;
-    }
-
-    const consecutive = this.consecutiveResults.get(clientId) || {
-      count: 0,
-      lastVerdict: null,
-      firstTimestamp: Date.now(),
-    };
-
-    if (consecutive.lastVerdict === verdict) {
-      consecutive.count += 1;
-    } else {
-      consecutive.count = 1;
-      consecutive.lastVerdict = verdict;
-      consecutive.firstTimestamp = Date.now();
-    }
-
-    this.consecutiveResults.set(clientId, consecutive);
+  clientIds() {
+    return Array.from(this.clients.keys());
   }
 
-  _shouldDeescalate(clientId, now) {
-    const firstTimestamp = this.consecutiveResults.get(clientId)?.firstTimestamp;
-    if (!firstTimestamp) return true;
-
-    const elapsedMinutes = (now - firstTimestamp) / 60000;
-    return elapsedMinutes >= this.escalationWindowMinutes;
-  }
-
-  getEscalationState(clientId) {
-    const consecutive = this.consecutiveResults.get(clientId) || { count: 0 };
-    const currentLevel = this.escalationLevels.get(clientId) || 0;
-
-    // Check if we should de-escalate
-    const now = Date.now();
-    const shouldDeescalate = this._shouldDeescalate(clientId, now);
-    if (shouldDeescalate && currentLevel > 0) {
-      this.escalationLevels.set(clientId, 0);
-    }
-
-    const cooldownSeconds = cooldownSecondsByLevel[currentLevel];
-
-    return {
-      level: currentLevel,
-      cooldownSeconds,
-      consecutiveCount: consecutive.count,
-    };
-  }
-
-  resetClient(clientId) {
-    this.minuteBuckets.delete(clientId);
-    this.consecutiveResults.delete(clientId);
-    this.escalationLevels.delete(clientId);
-    this.totalJudgesPerSession.delete(clientId);
-    this.lastSessionReset.delete(clientId);
+  size() {
+    return this.clients.size;
   }
 }
 
-module.exports = new AttemptTracker();
+class AttemptTracker {
+  constructor(options = {}) {
+    this.store =
+      options.store || new InMemoryAttemptStore({ maxClients: options.maxClients });
+    this.maxRequestsPerMinute =
+      options.maxRequestsPerMinute ?? config.maxRequestsPerMinute ?? 30;
+    this.maxJudgesPerSession =
+      options.maxJudgesPerSession ?? config.maxJudgesPerSession ?? 20;
+    this.escalationWindowMs =
+      (options.escalationWindowMinutes ?? config.escalationWindowMinutes ?? 30) *
+      60 *
+      1000;
+    this._now = options.nowFn || Date.now;
+
+    // Periodic hygiene sweep; unref'd so it never keeps the process alive.
+    if (options.sweep !== false) {
+      this._sweepTimer = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS);
+      if (this._sweepTimer.unref) this._sweepTimer.unref();
+    }
+  }
+
+  // Test seam / shutdown hook.
+  close() {
+    if (this._sweepTimer) clearInterval(this._sweepTimer);
+  }
+
+  sweep(now = this._now()) {
+    for (const clientId of this.store.clientIds()) {
+      this.store.prune(clientId, this.escalationWindowMs, now);
+    }
+  }
+
+  // Consecutive non-allow (deny/task) verdicts ending at the newest entry.
+  // The streak breaks on an allow, on leaving the window, or when the user
+  // demonstrably completed the previous reset (gap >= required wait) — i.e.
+  // escalation only grows when requests repeat WITHOUT completing resets.
+  _streak(entries) {
+    let streak = 0;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (entry.verdict === 'allow') break;
+      streak += 1;
+      if (i > 0) {
+        const prev = entries[i - 1];
+        const requiredMs = (prev.requiredWaitSeconds || 0) * 1000;
+        if (requiredMs > 0 && entry.ts - prev.ts >= requiredMs) break;
+      }
+    }
+    return streak;
+  }
+
+  _levelForStreak(streak) {
+    let level = 0;
+    for (let l = 1; l <= MAX_ESCALATION_LEVEL; l++) {
+      if (streak >= ESCALATION_STREAK_THRESHOLDS[l]) level = l;
+    }
+    return level;
+  }
+
+  getEscalation(clientId, now = this._now()) {
+    this.store.prune(clientId, this.escalationWindowMs, now);
+    const level = this._levelForStreak(this._streak(this.store.list(clientId)));
+    return { level, cooldownSeconds: ESCALATION_COOLDOWNS[level] };
+  }
+
+  // Pre-judge gate. Returns { allowed: true } or
+  // { allowed: false, status: 429, message, escalation }.
+  checkLimits(clientId, now = this._now()) {
+    this.store.prune(clientId, this.escalationWindowMs, now);
+    const entries = this.store.list(clientId);
+
+    const minuteAgo = now - ONE_MINUTE_MS;
+    const recentCount = entries.filter((e) => e.ts > minuteAgo).length;
+    if (recentCount >= this.maxRequestsPerMinute) {
+      return {
+        allowed: false,
+        status: 429,
+        message: 'Too many requests, please try again later.',
+        escalation: this.getEscalation(clientId, now),
+      };
+    }
+
+    const streak = this._streak(entries);
+    if (streak >= this.maxJudgesPerSession) {
+      return {
+        allowed: false,
+        status: 429,
+        message: 'Too many repeated requests. Please complete a reset and try again later.',
+        escalation: { level: MAX_ESCALATION_LEVEL, cooldownSeconds: ESCALATION_COOLDOWNS[MAX_ESCALATION_LEVEL] },
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  recordAttempt(clientId, { verdict, requiredWaitSeconds = 0 } = {}, now = this._now()) {
+    this.store.append(clientId, { ts: now, verdict, requiredWaitSeconds });
+  }
+}
+
+// Shared default tracker used by the route (reads live config).
+const defaultTracker = new AttemptTracker();
+
+module.exports = {
+  AttemptTracker,
+  InMemoryAttemptStore,
+  defaultTracker,
+  MAX_ESCALATION_LEVEL,
+};
